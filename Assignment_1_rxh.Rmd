@@ -1,0 +1,263 @@
+---
+title: "Assignment_1_rxh"
+author: "Rongxin Hu  2219247"
+date: "2025-03-06"
+documentclass: ctexart
+keywords:
+  - 中文
+  - R Markdown
+output:
+  rticles::ctex:
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+---
+
+
+# Load Necessary Packages
+
+```{r}
+library(httr)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(data.table)
+
+```
+
+
+# The FRED-MD Dataset & The Transformations
+
+## Load FRED-MD Dataset
+
+```{r }
+url <- "https://www.stlouisfed.org/-/media/project/frbstl/stlouisfed/research/fred-md/monthly/current.csv?sc_lang=en&hash=80445D12401C59CF716410F3F7863B64"
+
+response <- GET(url)
+if (http_error(response)) {
+  stop("Failed to download file.")
+} else {
+  df <- read_csv(content(response, as = "text", encoding = "UTF-8"))
+}
+print(df)
+
+#This method bypasses the HTTP connection issues that come with R
+```
+
+
+## Extract Transformation Codes
+
+```{r }
+transformation_codes <- data.frame(Series = names(df)[-1], Transformation_Code = as.numeric(df[1, -1]))
+
+```
+
+
+## Function to Apply Transformations 
+
+```{r }
+mdiff <- function(x) {
+    x - dplyr::lag(x, 1, default = NA)
+}
+
+
+apply_transformation <- function(series, code) {
+  if (code == 1) {
+    return(series)
+  } else if (code == 2) {
+    return(mdiff(series))
+  } else if (code == 3) {
+    return(mdiff(mdiff(series)))
+  } else if (code == 4) {
+    return(log(series))
+  } else if (code == 5) {
+    return(mdiff(log(series)))
+  } else if (code == 6) {
+    return(mdiff(mdiff(log(series))))
+  } else if (code == 7) {
+    return(mdiff(series) / dplyr::lag(series, 1) - 1)
+  } else {
+    stop("Invalid transformation code")
+  }
+}
+
+```
+
+
+## Applying the Transformations to Each Column 
+
+```{r }
+for (i in 1:nrow(transformation_codes)) {
+  series_name <- transformation_codes$Series[i]
+  code <- transformation_codes$Transformation_Code[i]
+  df[[series_name]] <- apply_transformation(as.numeric(df[[series_name]]), code)
+}
+
+df_cleaned <- df[-c(1:3), ]
+
+```
+
+
+## Plot Transformed Series
+
+```{r }
+series_to_plot <- c('INDPRO', 'CPIAUCSL', 'TB3MS')
+series_names <- c('Industrial Production', 'Inflation (CPI)', '3-month Treasury Bill rate')
+
+ plot_data <- df_cleaned %>%
+   select(sasdate, all_of(series_to_plot)) %>%
+   pivot_longer(-sasdate, names_to = "series", values_to = "value") %>%
+   mutate(sasdate = mdy(sasdate),
+          series_name = factor(series, levels = series_to_plot, labels = series_names))
+
+ ggplot(plot_data, aes(x = sasdate, y = value, color = series_name)) +
+   geom_line() +
+   facet_wrap(~series_name, scales = "free", ncol=1) +
+   theme_minimal() +
+   labs(x = "Year", y = "Transformed Value") +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+
+```
+
+
+# Forecasting in Time Series
+
+## Prepare Data for Estimation
+
+```{r }
+Yraw <- df_cleaned$INDPRO
+Xraw <- df_cleaned %>% select(CPIAUCSL, TB3MS)
+
+num_lags <- 4  # this is p
+num_leads <- 1  # this is h
+
+X <- data.frame(Ones = rep(1, nrow(df_cleaned)))
+
+for (lag in 0:num_lags) {
+  X[paste0('INDPRO_lag', lag)] <- dplyr::lag(Yraw, lag)
+}
+
+for (col in names(Xraw)) {
+  for (lag in 0:num_lags) {
+    X[paste0(col, '_lag', lag)] <- dplyr::lag(Xraw[[col]], lag)
+  }
+}
+
+y <- dplyr::lead(Yraw, num_leads)
+
+```
+
+## Getting the Last Row fro Forecasting
+
+```{r }
+X_T <- as.matrix(tail(X, 1))
+```
+
+
+## Removing NA Rows (Due to Lagging/Leading)
+
+```{r }
+complete_cases <- complete.cases(X, y)
+X <- X[complete_cases, ]
+y <- y[complete_cases]
+```
+
+
+## Estimation and Forecast
+
+```{r }
+y <- as.vector(y)
+X <- as.matrix(X)
+
+beta_ols <- solve(crossprod(X), crossprod(X, y))
+```
+
+
+## Produce the One Step Ahead Forecast
+
+```{r }
+forecast <- (X_T %*% beta_ols) * 100
+
+```
+
+# My Forecasting Exercise 
+
+## Defining Forecasting Functions (from hint)
+
+```{r }
+
+calculate_msfe <- function(y, X, num_lags, h) {
+  X <- as.matrix(X)  
+  n <- length(y)
+  errors <- numeric(n - num_lags - h)
+  
+  for (t in (num_lags + 1):(n - h)) {
+    # construct lag matrix
+    y_lags <- embed(y[1:t], num_lags + 1)[, -1, drop = FALSE]
+    X_lags <- lapply(1:ncol(X), function(i) {
+      x_col <- X[1:t, i]
+      embed(x_col, num_lags + 1)[, -1, drop = FALSE]
+    })
+    
+    # combined lagged variables
+    X_lags <- do.call(cbind, X_lags)
+    
+    #  # design mayrix (including intercept term)
+    design_matrix <- cbind(1, y_lags, X_lags)
+    
+    # fix the index range of y_target
+    y_target <- y[(num_lags + 1 + h):(t + h)]  
+    
+    complete_cases <- complete.cases(design_matrix, y_target)
+    design_matrix <- design_matrix[complete_cases, , drop = FALSE]
+    y_target <- y_target[complete_cases]
+    
+    # ensure sufficient number of rows in the design matrix
+    if (nrow(design_matrix) > ncol(design_matrix)) {
+      beta <- solve(t(design_matrix) %*% design_matrix) %*% t(design_matrix) %*% y_target
+      X_T <- c(1, tail(y_lags, 1), tail(X_lags, 1))
+      forecast <- X_T %*% beta
+      errors[t - num_lags] <- (y[t + h] - forecast)^2
+    } else {
+      errors[t - num_lags] <- NA
+    }
+  }
+  
+  MSFE <- mean(errors, na.rm = TRUE)
+  return(MSFE)
+}
+
+```
+
+
+## Different h to Our Model
+
+```{r }
+msfe_h1 <- calculate_msfe(Yraw, Xraw, num_lags = 4, h = 1)
+msfe_h4 <- calculate_msfe(Yraw, Xraw, num_lags = 4, h = 4)
+msfe_h8 <- calculate_msfe(Yraw, Xraw, num_lags = 4, h = 8)
+
+print(msfe_h1)
+print(msfe_h4)
+print(msfe_h8)
+
+```
+
+
+## Different p to Our Model
+
+```{r }
+msfe_p1 <- calculate_msfe(Yraw, Xraw, num_lags = 1, h = 4)
+msfe_p4 <- calculate_msfe(Yraw, Xraw, num_lags = 4, h = 4)
+msfe_p8 <- calculate_msfe(Yraw, Xraw, num_lags = 8, h = 4)
+
+print(msfe_p1)
+print(msfe_p4)
+print(msfe_p8)
+
+
+```
+
